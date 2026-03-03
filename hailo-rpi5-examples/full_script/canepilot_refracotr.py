@@ -92,6 +92,8 @@ rl_side_distance = _params["rl_side_distance"]
 num_cols = _params["num_distance_grid_cols"]
 num_rows = _params["num_distance_grid_rows"]
 api_key = _params["OPENAI_API_KEY"]
+# DepthAI spatialCoordinates unit: raw * this = mm. 0.01 if device returns ~100x scale; 1.0 if true mm.
+SPATIAL_RAW_TO_MM = _params.get("spatial_raw_to_mm", 0.01)
 
 
 # ---------------------------------------------------------------------------
@@ -229,8 +231,9 @@ def _classify_spatial_rois(spatial_data: list) -> tuple[list, list, list]:
         )
 
         coords = depth_data.spatialCoordinates
-        distance = math.sqrt(coords.x**2 + coords.y**2 + coords.z**2)
-        height = coords.y
+        raw_dist = math.sqrt(coords.x**2 + coords.y**2 + coords.z**2)
+        distance = raw_dist * SPATIAL_RAW_TO_MM  # mm
+        height = coords.y * SPATIAL_RAW_TO_MM    # mm
 
         is_hazard = False
         floor_level = False
