@@ -1,121 +1,109 @@
 #!/usr/bin/env python3
+import argparse
+import os
 import time
 import cv2
 import depthai as dai
+import requests
 
-SHOW_WINDOWS = False
+SERVER_URL_DEFAULT = "https://canepilotaivisionserver.aalwan.net/detect"
+TIMEOUT_S_DEFAULT = 10
 
-GIF_PATH = "capture.gif"
-GIF_FPS = 10.0                 # output GIF FPS
-GIF_INTERVAL = 1.0 / GIF_FPS
-MAX_GIF_SECONDS = 15           # cap length to avoid huge gifs (adjust as needed)
+def is_valid_jpeg(jpeg_bytes: bytes) -> bool:
+    return (
+        isinstance(jpeg_bytes, (bytes, bytearray)) and
+        len(jpeg_bytes) > 4 and
+        jpeg_bytes[0:2] == b"\xff\xd8" and
+        jpeg_bytes[-2:] == b"\xff\xd9"
+    )
 
-PREVIEW_W, PREVIEW_H = 640, 400
-
-def build_pipeline():
+def build_rgb_only_pipeline():
+    """
+    DepthAI 3: Camera node (replaces deprecated ColorCamera), 640x400 BGR output.
+    """
     pipeline = dai.Pipeline()
 
-    camRgb = pipeline.create(dai.node.ColorCamera)
-    camRgb.setPreviewSize(PREVIEW_W, PREVIEW_H)
-    camRgb.setInterleaved(False)
-    camRgb.setBoardSocket(dai.CameraBoardSocket.RGB)
+    camRgb = pipeline.create(dai.node.Camera).build(
+        boardSocket=dai.CameraBoardSocket.CAM_A
+    )
+    camera_output = camRgb.requestOutput(
+        (640, 400),
+        type=dai.ImgFrame.Type.BGR888p,
+    )
+    rgb_queue = camera_output.createOutputQueue(maxSize=4, blocking=True)
+    return pipeline, rgb_queue
 
-    xoutRgb = pipeline.create(dai.node.XLinkOut)
-    xoutRgb.setStreamName("rgb")
-    camRgb.preview.link(xoutRgb.input)
 
-    return pipeline
-
-def write_gif_opencv(frames_bgr, path, fps):
+def capture_one_jpeg(rgb_queue, quality: int = 90) -> tuple[bytes, any]:
     """
-    Try writing GIF using OpenCV VideoWriter. Returns True if success.
+    Returns (jpg_bytes, bgr_frame)
     """
-    if not frames_bgr:
-        return False
+    # Grab one frame (blocking)
+    pkt = rgb_queue.get()
+    frame = pkt.getCvFrame()  # BGR np.ndarray
 
-    h, w = frames_bgr[0].shape[:2]
-    fourcc = cv2.VideoWriter_fourcc(*"GIF ")  # may or may not exist depending on build
-    writer = cv2.VideoWriter(path, fourcc, fps, (w, h), True)
+    ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
+    if not ok:
+        raise RuntimeError("cv2.imencode(.jpg) failed")
 
-    if not writer.isOpened():
-        return False
+    jpg = buf.tobytes()
+    if not is_valid_jpeg(jpg):
+        raise RuntimeError(f"Invalid JPEG produced (len={len(jpg)})")
 
-    for f in frames_bgr:
-        writer.write(f)
-    writer.release()
-    return True
-
-def write_gif_imageio(frames_bgr, path, fps):
-    """
-    Fallback GIF writer using imageio (pip install imageio).
-    Converts BGR->RGB.
-    """
-    import imageio.v2 as imageio
-    frames_rgb = [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in frames_bgr]
-    duration = 1.0 / fps
-    imageio.mimsave(path, frames_rgb, format="GIF", duration=duration)
+    return jpg, frame
 
 def main():
-    pipeline = build_pipeline()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out", default="captured.jpg", help="Output JPEG path")
+    ap.add_argument("--quality", type=int, default=90, help="JPEG quality 1-100")
+    ap.add_argument("--show", action="store_true", help="Show captured frame in a window")
+    ap.add_argument("--send", action="store_true", help="POST the captured JPEG to server")
+    ap.add_argument("--server", default=SERVER_URL_DEFAULT, help="Server /detect URL")
+    ap.add_argument("--timeout", type=int, default=TIMEOUT_S_DEFAULT, help="HTTP timeout seconds")
+    args = ap.parse_args()
 
-    frames = []
-    last_gif_add = 0.0
-    start = time.time()
-
-    print("Streaming... press Ctrl+C to stop and save GIF.")
-
+    pipeline, rgb_queue = build_rgb_only_pipeline()
+    pipeline.start()
     try:
-        with dai.Device(pipeline) as device:
-            rgbQueue = device.getOutputQueue(name="rgb", maxSize=4, blocking=False)
+        # small warmup (optional): discard a couple frames so exposure settles a bit
+        warmup_start = time.time()
+        while time.time() - warmup_start < 0.2:
+            if rgb_queue.has():
+                _ = rgb_queue.get()
 
-            while True:
-                inRgb = rgbQueue.tryGet()
-                if inRgb is None:
-                    time.sleep(0.001)
-                    continue
-
-                frame = inRgb.getCvFrame()
-
-                if SHOW_WINDOWS:
-                    cv2.imshow("rgb", frame)
-                    if cv2.waitKey(1) & 0xFF == ord("q"):
-                        raise KeyboardInterrupt
-
-                # Add frame to GIF buffer at GIF_FPS rate
-                now = time.time()
-                if now - last_gif_add >= GIF_INTERVAL:
-                    last_gif_add = now
-                    frames.append(frame.copy())
-
-                # Optional cap so you don't eat RAM forever
-                if now - start > MAX_GIF_SECONDS:
-                    print(f"Reached MAX_GIF_SECONDS={MAX_GIF_SECONDS}, stopping...")
-                    break
-
-    except KeyboardInterrupt:
-        print("\nInterrupted. Saving GIF...")
-
+        jpg, frame = capture_one_jpeg(rgb_queue, quality=args.quality)
     finally:
-        if SHOW_WINDOWS:
-            cv2.destroyAllWindows()
+        pipeline.stop()
 
-    if not frames:
-        print("No frames captured; not writing GIF.")
-        return
+    # Save JPEG
+    out_dir = os.path.dirname(os.path.abspath(args.out))
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    with open(args.out, "wb") as f:
+        f.write(jpg)
+    print(f"Saved: {os.path.abspath(args.out)} ({len(jpg)} bytes)")
 
-    # Try OpenCV first, then imageio fallback
-    ok = write_gif_opencv(frames, GIF_PATH, GIF_FPS)
-    if ok:
-        print(f"Saved GIF with OpenCV: {GIF_PATH} (frames={len(frames)}, fps={GIF_FPS})")
-        return
+    # Optional show
+    if args.show:
+        cv2.imshow("captured", frame)
+        print("Press any key to exit preview...")
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
 
-    try:
-        write_gif_imageio(frames, GIF_PATH, GIF_FPS)
-        print(f"Saved GIF with imageio: {GIF_PATH} (frames={len(frames)}, fps={GIF_FPS})")
-    except Exception as e:
-        print("Failed to write GIF (OpenCV and imageio fallback both failed).")
-        print("Error:", e)
-        print("Fix: pip install imageio  (or install ffmpeg/imagemagick depending on your environment)")
+    # Optional send
+    if args.send:
+        sess = requests.Session()
+        files = {"file": (os.path.basename(args.out), jpg, "image/jpeg")}
+        try:
+            r = sess.post(args.server, files=files, timeout=args.timeout)
+            r.raise_for_status()
+            ctype = r.headers.get("Content-Type", "")
+            if "application/json" in ctype:
+                print("Server JSON:", r.json())
+            else:
+                print("Server:", r.text[:1000])
+        except requests.RequestException as e:
+            print("POST failed:", e)
 
 if __name__ == "__main__":
     main()
