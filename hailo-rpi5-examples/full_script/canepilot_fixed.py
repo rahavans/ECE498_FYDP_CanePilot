@@ -5,8 +5,8 @@ All YOLO inference and speech-to-text run on the remote GPU server.
 The Pi handles: OAK-D depth + RGB capture, spatial hazard detection,
 haptic motor control, button input, and LLM scene description.
 
-Camera frames are compressed on the OAK-D's ISP (VideoEncoder → MJPEG)
-so the Pi CPU never touches raw pixels for inference purposes.
+RGB capture uses DepthAI 3 Camera node (same as test_camera.py):
+640x400 BGR from device, JPEG encoded on host for detection/LLM.
 """
 
 import cv2
@@ -37,8 +37,8 @@ SERVER_URL       = "https://canepilotaivisionserver.aalwan.net"
 DETECT_ENDPOINT  = f"{SERVER_URL}/detect"
 OPENAI_ENDPOINT  = "https://api.openai.com/v1/chat/completions"
 
-# JPEG quality for the on-device encoder.
-# Q=30 → typical outdoor frame ≈ 15–25 KB at 640×400  (vs ~768 KB raw)
+# JPEG quality for host-side encoding (same as test_camera approach).
+# Q=30 → typical outdoor frame ≈ 15–25 KB at 640×400
 JPEG_QUALITY     = 30
 
 # Send a frame to /detect every N iterations of the main loop.
@@ -503,39 +503,28 @@ class _Timer:
 _timer = _Timer()
 
 
-# ── DepthAI pipeline ──────────────────────────────────────────────────────────
+# ── DepthAI pipeline (DepthAI 3: Camera node + createOutputQueue, no XLinkOut) ─
 pipeline = dai.Pipeline()
 
 monoLeft  = pipeline.create(dai.node.MonoCamera)
 monoRight = pipeline.create(dai.node.MonoCamera)
 stereo    = pipeline.create(dai.node.StereoDepth)
 slc       = pipeline.create(dai.node.SpatialLocationCalculator)  # SLC = spatial location calc
-camRgb    = pipeline.create(dai.node.ColorCamera)
 
-# On-device MJPEG encoder — the OAK-D's ISP chip compresses frames before
-# sending them over USB, saving significant Pi CPU time.
-videoEnc = pipeline.create(dai.node.VideoEncoder)
-videoEnc.setDefaultProfilePreset(15, dai.VideoEncoderProperties.Profile.MJPEG)
-videoEnc.setQuality(JPEG_QUALITY)
-
-xout_depth   = pipeline.create(dai.node.XLinkOut)
-xout_spatial = pipeline.create(dai.node.XLinkOut)
-xout_enc     = pipeline.create(dai.node.XLinkOut)
-xin_slc_cfg  = pipeline.create(dai.node.XLinkIn)
-
-xout_depth.setStreamName("depth")
-xout_spatial.setStreamName("spatialData")
-xout_enc.setStreamName("rgbEnc")
-xin_slc_cfg.setStreamName("spatialCalcConfig")
+# RGB: same method as test_camera.py — Camera node, 640x400 BGR, host-side JPEG encode
+camRgb = pipeline.create(dai.node.Camera).build(
+    boardSocket=dai.CameraBoardSocket.CAM_A
+)
+camera_output = camRgb.requestOutput(
+    (RGB_W, RGB_H),
+    type=dai.ImgFrame.Type.BGR888p,
+)
+rgb_queue = camera_output.createOutputQueue(maxSize=4, blocking=True)
 
 monoLeft.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
 monoLeft.setCamera("left")
 monoRight.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
 monoRight.setCamera("right")
-
-camRgb.setPreviewSize(RGB_W, RGB_H)
-camRgb.setInterleaved(False)
-camRgb.setBoardSocket(dai.CameraBoardSocket.RGB)
 
 stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.HIGH_DENSITY)
 stereo.setLeftRightCheck(False)
@@ -562,18 +551,9 @@ for row in range(num_rows):
 monoLeft.out.link(stereo.left)
 monoRight.out.link(stereo.right)
 stereo.depth.link(slc.inputDepth)
-slc.passthroughDepth.link(xout_depth.input)
-slc.out.link(xout_spatial.input)
-xin_slc_cfg.out.link(slc.inputConfig)
-# Camera → on-device encoder → XLink (already compressed JPEG over USB)
-camRgb.video.link(videoEnc.input)
-videoEnc.bitstream.link(xout_enc.input)
-
-# Optional raw preview for SHOW_WINDOWS only
-if SHOW_WINDOWS:
-    xout_raw = pipeline.create(dai.node.XLinkOut)
-    xout_raw.setStreamName("rgb")
-    camRgb.preview.link(xout_raw.input)
+# DepthAI 3: output queues from node outputs (no XLinkOut)
+depth_queue   = slc.passthroughDepth.createOutputQueue(maxSize=4, blocking=False)
+spatial_queue = slc.out.createOutputQueue(maxSize=4, blocking=False)
 
 
 # ── Startup ───────────────────────────────────────────────────────────────────
@@ -591,37 +571,27 @@ _fps_start   = time.time()
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
-with dai.Device(pipeline) as device:
-    q_depth   = device.getOutputQueue(name="depth",       maxSize=4, blocking=False)
-    q_spatial = device.getOutputQueue(name="spatialData", maxSize=4, blocking=False)
-    q_enc     = device.getOutputQueue(name="rgbEnc",      maxSize=2, blocking=False)
-    q_raw     = (device.getOutputQueue(name="rgb", maxSize=2, blocking=False)
-                 if SHOW_WINDOWS else None)
-
+pipeline.start()
+try:
     _timer.log("setup")
 
     while True:
-        # ── Capture ───────────────────────────────────────────────────────
-        depth_frame  = q_depth.get().getFrame()
-        spatial_data = q_spatial.get().getSpatialLocations()
-        jpeg_bytes   = bytes(q_enc.get().getData())     # MJPEG from OAK-D ISP
-
-        # Decoded frame: only needed for SHOW_WINDOWS + LLM callbacks
-        rgb_frame = None
-        if SHOW_WINDOWS and q_raw:
-            rgb_frame = q_raw.get().getCvFrame()
+        # ── Capture (same method as test_camera: BGR from queue, JPEG on host) ─
+        depth_frame  = depth_queue.get().getFrame()
+        spatial_data = spatial_queue.get().getSpatialLocations()
+        rgb_frame    = rgb_queue.get().getCvFrame()
+        ok, buf      = cv2.imencode(".jpg", rgb_frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+        jpeg_bytes   = buf.tobytes() if ok else b""
 
         with _global_data_lock:
-            _global_rgb_frame    = (rgb_frame if rgb_frame is not None else
-                                    cv2.imdecode(np.frombuffer(jpeg_bytes, np.uint8),
-                                                 cv2.IMREAD_COLOR))
+            _global_rgb_frame    = rgb_frame
             _global_spatial_data = spatial_data
 
         _timer.log("capture")
 
         # ── Enqueue frame for server detection (non-blocking) ─────────────
-        if frame_count % DETECT_EVERY_N == 0:
-            _enqueue_jpeg(jpeg_bytes)   # OAK-D JPEG, zero re-encode cost
+        if frame_count % DETECT_EVERY_N == 0 and jpeg_bytes and _looks_like_jpeg(jpeg_bytes):
+            _enqueue_jpeg(jpeg_bytes)
 
         # ── Pull latest server results ────────────────────────────────────
         with _detect_result_lock:
@@ -719,6 +689,8 @@ with dai.Device(pipeline) as device:
 
         _timer.print_and_reset()
 
+finally:
+    pipeline.stop()
 
 # ── Teardown ──────────────────────────────────────────────────────────────────
 _stop_detect_worker.set()
