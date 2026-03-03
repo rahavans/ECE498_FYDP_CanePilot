@@ -4,7 +4,7 @@ import cv2
 import depthai as dai
 import requests
 
-SERVER_URL = "http://https://canepilotaivisionserver.aalwan.net/detect"  # <-- change
+SERVER_URL = "https://canepilotaivisionserver.aalwan.net/detect"  # <-- change
 TIMEOUT_S = 10
 SHOW = False
 
@@ -26,7 +26,7 @@ def build_pipeline():
     cam.setFps(30)
 
     # Use preview to reduce bandwidth/latency
-    cam.preview.setSize(640, 360)
+    cam.setPreviewSize(640, 360)
     cam.setInterleaved(False)
     cam.setColorOrder(dai.ColorCameraProperties.ColorOrder.BGR)
 
@@ -80,8 +80,8 @@ def main():
             try:
                 # Most common: multipart/form-data upload
                 files = {"file": ("f.jpg", jpg, "image/jpeg")}
-                data={"enable_tracking": "false"},
-                r = sess.post(SERVER_URL, files=files, data=data, timeout=TIMEOUT_S)
+                #data={"enable_tracking": "false"},
+                r = sess.post(SERVER_URL, files=files, timeout=TIMEOUT_S)
                 r.raise_for_status()
 
                 # If server returns JSON:
