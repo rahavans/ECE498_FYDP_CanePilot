@@ -769,6 +769,17 @@ def run_main_loop(pipeline, depth_queue, spatial_queue, rgb_queue):
             timer.log("server results")
 
             red_rois, yellow_rois, floor_rois = _classify_spatial_rois(spatial_data)
+            # Log classified spatial ROIs
+            hazard_detail = ""
+            if red_rois:
+                parts = [f"#{r['index']}:{r['distance']/1000:.2f}m" for r in red_rois[:12]]
+                if len(red_rois) > 12:
+                    parts.append(f"+{len(red_rois) - 12} more")
+                hazard_detail = " [hazards: " + ", ".join(parts) + "]"
+            logger.info(
+                "spatial_rois: red=%d yellow=%d floor=%d%s",
+                len(red_rois), len(yellow_rois), len(floor_rois), hazard_detail,
+            )
             region_config = _compute_haptic_config(red_rois)
             timer.log("spatial")
 
