@@ -11,6 +11,7 @@ RGB capture uses DepthAI 3 Camera node (same as test_camera.py):
 
 import base64
 import json
+import logging
 import math
 import threading
 import time
@@ -59,6 +60,16 @@ JPEG_QUALITY = 30
 DETECT_EVERY_N = 3
 
 RGB_W, RGB_H = 640, 400
+
+# Logger for server results and haptic events
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    _log_handler = logging.StreamHandler()
+    _log_handler.setFormatter(
+        logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
+    )
+    logger.addHandler(_log_handler)
 
 
 def load_params():
@@ -141,10 +152,22 @@ def _dist_to_haptic(d_mm: float) -> tuple:
     return (1, 40)
 
 
+MOTOR_NAMES = ("left", "middle", "right")
+
+
 def vibrate_motors(config3: list):
     if len(config3) != 3:
         raise ValueError("Expected 3 (power, duration) tuples")
     controller.vibrate_motors(config3)
+    # Log which motors vibrated and when
+    active = [
+        (MOTOR_NAMES[i], power, duration_ms)
+        for i, (power, duration_ms) in enumerate(config3)
+        if (power, duration_ms) != (0, 0)
+    ]
+    if active:
+        parts = ", ".join(f"{name}(power={p}, duration_ms={d})" for name, p, d in active)
+        logger.info("vibrate motors: %s", parts)
 
 
 # ---------------------------------------------------------------------------
@@ -301,9 +324,24 @@ def _detection_worker():
                 print(f"[detect] HTTP {resp.status_code}: {resp.text[:500]}")
             resp.raise_for_status()
             data = resp.json()
+            tracks = data.get("tracks", [])
+            detections = data.get("detections", [])
             with _detect_result_lock:
-                _latest_tracks = data.get("tracks", [])
-                _latest_detections = data.get("detections", [])
+                _latest_tracks = tracks
+                _latest_detections = detections
+            # Log server result
+            if tracks:
+                summary = ", ".join(f"#{t.get('track_id')} {t.get('class', '?')}" for t in tracks[:8])
+                if len(tracks) > 8:
+                    summary += f" (+{len(tracks) - 8} more)"
+                logger.info("server result: tracks=%d detections=%d [%s]", len(tracks), len(detections), summary)
+            elif detections:
+                summary = ", ".join(d.get("class", "?") for d in detections[:8])
+                if len(detections) > 8:
+                    summary += f" (+{len(detections) - 8} more)"
+                logger.info("server result: tracks=0 detections=%d [%s]", len(detections), summary)
+            else:
+                logger.info("server result: tracks=0 detections=0")
         except requests.exceptions.Timeout:
             print("[detect] timeout — server busy?")
         except requests.exceptions.ConnectionError:
