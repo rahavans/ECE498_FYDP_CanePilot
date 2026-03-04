@@ -15,12 +15,12 @@ import logging
 import math
 import threading
 import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import cv2
 import depthai as dai
 import numpy as np
 import requests
-from scipy.integrate import quad
 
 import haptic_motor_diff as haptic
 from speak_text import speak_text
@@ -43,12 +43,14 @@ from speech_to_text import (
 # Config
 # ---------------------------------------------------------------------------
 
-SHOW_WINDOWS = False  # set True only for debugging with a monitor
+SHOW_WINDOWS = True  # set True only for debugging with a monitor
+STREAM_PORT = 8080   # open http://<pi-ip>:8080 in browser for live view
 DEBUG = False
 ENABLE_TRACKING = True
 LOG_TIME = False
 
-SERVER_URL = "https://canepilotaivisionserver.aalwan.net"
+# SERVER_URL = "https://canepilotaivisionserver.aalwan.net"
+SERVER_URL = "http://99.255.125.41:8000"
 DETECT_ENDPOINT = f"{SERVER_URL}/detect"
 OPENAI_ENDPOINT = "https://api.openai.com/v1/chat/completions"
 
@@ -63,13 +65,73 @@ RGB_W, RGB_H = 640, 400
 
 # Logger for server results and haptic events
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG if DEBUG else logging.WARNING)
 if not logger.handlers:
     _log_handler = logging.StreamHandler()
     _log_handler.setFormatter(
         logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
     )
     logger.addHandler(_log_handler)
+
+
+# ---------------------------------------------------------------------------
+# MJPEG stream server (view at http://<pi-ip>:STREAM_PORT when SHOW_WINDOWS)
+# ---------------------------------------------------------------------------
+
+_stream_frame: bytes = b""
+_stream_lock = threading.Lock()
+_stream_clients: list = []
+_stream_clients_lock = threading.Lock()
+
+
+class _MJPEGHandler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        pass  # suppress access logs
+
+    def do_GET(self):
+        if self.path == "/":
+            self.send_response(200)
+            self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+            self.end_headers()
+            q = []
+            with _stream_clients_lock:
+                _stream_clients.append(q)
+            try:
+                while True:
+                    if q:
+                        jpeg = q.pop(0)
+                    else:
+                        time.sleep(0.02)
+                        continue
+                    self.wfile.write(
+                        b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpeg + b"\r\n"
+                    )
+                    self.wfile.flush()
+            except Exception:
+                pass
+            finally:
+                with _stream_clients_lock:
+                    if q in _stream_clients:
+                        _stream_clients.remove(q)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+
+def _push_stream_frame(jpeg: bytes):
+    with _stream_clients_lock:
+        for q in _stream_clients:
+            if len(q) < 2:  # drop old frames if client is slow
+                q.append(jpeg)
+
+
+def _start_stream_server():
+    if not SHOW_WINDOWS:
+        return
+    server = HTTPServer(("0.0.0.0", STREAM_PORT), _MJPEGHandler)
+    t = threading.Thread(target=server.serve_forever, daemon=True, name="mjpeg-server")
+    t.start()
+    print(f"[stream] Live view at http://<pi-ip>:{STREAM_PORT}")
 
 
 def load_params():
@@ -83,9 +145,7 @@ def load_params():
 # ---------------------------------------------------------------------------
 
 _params = load_params()
-persons_height = _params["persons_height_cm"]
 hfov = _params["hfov"]
-vfov = _params["vfov"]
 rl_min_distance = _params["rl_min_distance"]
 rl_max_distance = _params["rl_max_distance"]
 rl_side_distance = _params["rl_side_distance"]
@@ -117,6 +177,8 @@ WINDOW_LEN = 5
 _warned_track_ids: set[int] = set()
 
 _stop_detect_worker = threading.Event()
+_system_active = threading.Event()  # starts NOT set; single press turns on, triple press turns off
+_describe_in_progress = threading.Event()  # guard against double-fire
 _stt_session = None
 
 
@@ -124,14 +186,7 @@ _stt_session = None
 # Geometry (derived from params)
 # ---------------------------------------------------------------------------
 
-camera_height_mm = (persons_height * 0.5) * 10
 min_dist_horizontal_mm = (rl_side_distance / math.tan(math.radians(hfov / 2))) * 1000
-
-_integral, _ = quad(
-    lambda x: num_cols / (x * math.tan(math.radians(vfov / 2))),
-    min_dist_horizontal_mm / 1000,
-    rl_max_distance,
-)
 _center_rl_squares = (num_cols if num_cols % 2 == 0 else num_cols - 1) // 2
 _center_square = (num_cols // 2) + 1 if num_cols % 2 == 1 else 0
 
@@ -169,7 +224,7 @@ def vibrate_motors(config3: list):
     ]
     if active:
         parts = ", ".join(f"{name}(power={p}, duration_ms={d})" for name, p, d in active)
-        logger.info("vibrate motors: %s", parts)
+        print("vibrate motors: %s", parts)
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +265,37 @@ def _bbox_hits_roi(bbox: tuple, roi_rect: tuple) -> bool:
 # Spatial hazard classification
 # ---------------------------------------------------------------------------
 
+def _filter_distance_grid(spatial_data: list) -> np.ndarray:
+    """
+    Build a (num_rows * num_cols,) array of distances (mm) with outliers zeroed out.
+    A cell is an outlier if its distance deviates >50% from its 3x3 neighbourhood median
+    and at least 3 valid neighbours exist to compare against.
+    """
+    n = len(spatial_data)
+    raw = np.zeros(n, dtype=np.float32)
+    for i, depth_data in enumerate(spatial_data):
+        coords = depth_data.spatialCoordinates
+        raw[i] = math.sqrt(coords.x**2 + coords.y**2 + coords.z**2) * SPATIAL_RAW_TO_MM
+
+    grid = raw.reshape(num_rows, num_cols)
+    filtered = grid.copy()
+    for r in range(num_rows):
+        for c in range(num_cols):
+            cell = grid[r, c]
+            if cell <= 0:
+                continue
+            r0, r1 = max(0, r - 1), min(num_rows, r + 2)
+            c0, c1 = max(0, c - 1), min(num_cols, c + 2)
+            patch = grid[r0:r1, c0:c1].flatten()
+            valid = patch[patch > 0]
+            if len(valid) < 3:
+                continue
+            med = float(np.median(valid))
+            if med > 0 and abs(cell - med) / med > 0.5:
+                filtered[r, c] = 0  # zero = invalid; won't trigger any hazard condition
+    return filtered.flatten()
+
+
 def _classify_spatial_rois(spatial_data: list) -> tuple[list, list, list]:
     """
     Classify each spatial ROI into red (hazard), yellow (caution), or floor.
@@ -219,6 +305,8 @@ def _classify_spatial_rois(spatial_data: list) -> tuple[list, list, list]:
     red_rois = []
     yellow_rois = []
     floor_rois = []
+
+    filtered_distances = _filter_distance_grid(spatial_data)
 
     for i, depth_data in enumerate(spatial_data):
         roi = depth_data.config.roi
@@ -230,27 +318,18 @@ def _classify_spatial_rois(spatial_data: list) -> tuple[list, list, list]:
             int(roi_rgb.bottomRight().y),
         )
 
-        coords = depth_data.spatialCoordinates
-        raw_dist = math.sqrt(coords.x**2 + coords.y**2 + coords.z**2)
-        distance = raw_dist * SPATIAL_RAW_TO_MM  # mm
-        height = coords.y * SPATIAL_RAW_TO_MM    # mm
+        distance = float(filtered_distances[i])          # mm, outliers zeroed
 
         is_hazard = False
-        floor_level = False
 
-        if height < 0 and height <= -camera_height_mm:
-            floor_level = True
-        elif (camera_height_mm + height) <= persons_height * 10 + 100:
-            if (camera_height_mm + height) >= persons_height * 10 - 100:
+        if rl_min_distance * 1000 <= distance <= min_dist_horizontal_mm:
+            is_hazard = True
+        elif min_dist_horizontal_mm < distance <= rl_max_distance * 1000:
+            col = (i % num_cols) + 1
+            half = _center_rl_squares // 2
+            middle_cols = list(range(_center_square - half, _center_square + half + 1))
+            if col in middle_cols:
                 is_hazard = True
-            if rl_min_distance * 1000 <= distance <= min_dist_horizontal_mm:
-                is_hazard = True
-            elif min_dist_horizontal_mm < distance <= rl_max_distance * 1000:
-                col = (i % num_cols) + 1
-                half = _center_rl_squares // 2
-                middle_cols = list(range(_center_square - half, _center_square + half + 1))
-                if col in middle_cols:
-                    is_hazard = True
 
         hist = _hazard_history.setdefault(i, [])
         hist.append(is_hazard)
@@ -262,17 +341,14 @@ def _classify_spatial_rois(spatial_data: list) -> tuple[list, list, list]:
             "index": i,
             "roi_rect": rect,
             "distance": distance,
-            "height": height,
             "roi": roi,
         }
         if confirmed_hazard:
             red_rois.append(roi_info)
-        elif floor_level:
-            floor_rois.append(roi_info)
         else:
             yellow_rois.append(roi_info)
 
-    return red_rois, yellow_rois, floor_rois
+    return red_rois, yellow_rois, []
 
 
 # ---------------------------------------------------------------------------
@@ -310,10 +386,11 @@ def _detection_worker():
             continue
 
         if not _looks_like_jpeg(jpeg):
-            print(
-                f"[detect] dropping partial/invalid JPEG: len={len(jpeg)} "
-                f"head={jpeg[:4].hex()} tail={jpeg[-4:].hex()}"
-            )
+            if DEBUG:
+                print(
+                    f"[detect] dropping partial/invalid JPEG: len={len(jpeg)} "
+                    f"head={jpeg[:4].hex()} tail={jpeg[-4:].hex()}"
+                )
             continue
 
         try:
@@ -323,7 +400,7 @@ def _detection_worker():
                 data={"enable_tracking": str(ENABLE_TRACKING).lower()},
                 timeout=5,
             )
-            if resp.status_code != 200:
+            if resp.status_code != 200 and DEBUG:
                 print(f"[detect] HTTP {resp.status_code}: {resp.text[:500]}")
             resp.raise_for_status()
             data = resp.json()
@@ -346,12 +423,15 @@ def _detection_worker():
             else:
                 logger.info("server result: tracks=0 detections=0")
         except requests.exceptions.Timeout:
-            print("[detect] timeout — server busy?")
+            if DEBUG:
+                print("[detect] timeout — server busy?")
         except requests.exceptions.ConnectionError:
-            print("[detect] connection error — retrying in 1 s...")
+            if DEBUG:
+                print("[detect] connection error — retrying in 1 s...")
             time.sleep(1)
         except Exception as exc:
-            print(f"[detect] error: {exc}")
+            if DEBUG:
+                print(f"[detect] error: {exc}")
 
 
 def _enqueue_jpeg(jpeg_bytes: bytes):
@@ -380,7 +460,7 @@ def describe_scene_in_detail():
     def _call():
         b64 = _encode_frame_for_llm(frame)
         payload = {
-            "model": "gpt-4.1-nano",
+            "model": "gpt-5-nano",
             "messages": [
                 {
                     "role": "user",
@@ -401,7 +481,6 @@ def describe_scene_in_detail():
                     ],
                 },
             ],
-            "max_tokens": 500,
         }
         r = requests.post(
             OPENAI_ENDPOINT,
@@ -413,7 +492,12 @@ def describe_scene_in_detail():
             timeout=20,
         )
         if r.status_code == 200:
-            speak_text(r.json()["choices"][0]["message"]["content"])
+            data = r.json()
+            content = data["choices"][0]["message"].get("content") or ""
+            if content:
+                speak_text(content)
+            else:
+                print(f"[llm] describe empty response: {data}")
         else:
             print(f"[llm] describe error {r.status_code}: {r.text}")
 
@@ -429,30 +513,26 @@ def question_llm(question: str):
     def _call():
         b64 = _encode_frame_for_llm(frame)
         payload = {
-            "model": "gpt-4.1-nano",
+            "model": "gpt-5-nano",
             "messages": [
                 {
                     "role": "system",
+                    "content": (
+                        "You are replacement eyes for a blind person. "
+                        "Answer user questions based on the image. Max 3 sentences."
+                    ),
+                },
+                {
+                    "role": "user",
                     "content": [
-                        {
-                            "type": "text",
-                            "text": (
-                                "You are replacement eyes for a blind person. "
-                                "Answer user questions based on the image. Max 3 sentences."
-                            ),
-                        },
                         {
                             "type": "image_url",
                             "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
                         },
+                        {"type": "text", "text": question},
                     ],
                 },
-                {
-                    "role": "user",
-                    "content": [{"type": "text", "text": question}],
-                },
             ],
-            "max_tokens": 500,
         }
         r = requests.post(
             OPENAI_ENDPOINT,
@@ -497,12 +577,13 @@ def _single_click_identify():
             data={"enable_tracking": "false"},
             timeout=8,
         )
-        if resp.status_code != 200:
+        if resp.status_code != 200 and DEBUG:
             print(f"[single_click] HTTP {resp.status_code}: {resp.text[:500]}")
         resp.raise_for_status()
         detections = resp.json().get("detections", [])
     except Exception as exc:
-        print(f"[single_click] server error: {exc}")
+        if DEBUG:
+            print(f"[single_click] server error: {exc}")
         return
 
     red_rois, _, _ = _classify_spatial_rois(spatial_data)
@@ -523,27 +604,47 @@ def _single_click_identify():
 
 
 def single_click():
-    _single_click_identify()
+    if not _system_active.is_set():
+        _warned_track_ids.clear()
+        _hazard_history.clear()
+        _system_active.set()
+        speak_text("On")
+    else:
+        _single_click_identify()
 
 
 def double_click():
-    speak_text("Please stand straight and point camera towards direction you want described")
-    time.sleep(10)
-    speak_text("Analyzing")
-    describe_scene_in_detail()
+    if not _system_active.is_set():
+        return
+    if _describe_in_progress.is_set():
+        return
+    _describe_in_progress.set()
+    try:
+        speak_text("Please stand straight and point camera towards direction you want described")
+        time.sleep(10)
+        speak_text("Analyzing")
+        describe_scene_in_detail()
+    finally:
+        _describe_in_progress.clear()
 
 
 def hold():
+    if not _system_active.is_set():
+        return
     global _stt_session
     speak_text("Listening")
     _stt_session = start_listening(max_duration=60)
 
 
 def triple_click():
-    pass
+    if _system_active.is_set():
+        _system_active.clear()
+        speak_text("Off")
 
 
 def hold_release():
+    if not _system_active.is_set():
+        return
     global _stt_session
     if _stt_session is None:
         return
@@ -556,7 +657,8 @@ def hold_release():
     transcription = transcription.lower()
     if "question" in transcription:
         q = transcription.replace("question", "", 1).strip()
-        print(f"[button] Questioning LLM: {q!r}")
+        if DEBUG:
+            print(f"[button] Questioning LLM: {q!r}")
         question_llm(q)
 
 
@@ -580,7 +682,8 @@ class _Timer:
             return
         parts = "  |  ".join(f"{l}: {e*1000:.1f}ms" for l, e in self._logs)
         total = (self._last - self._start) * 1000
-        print(f"{parts}  |  Total: {total:.1f}ms")
+        if DEBUG:
+            print(f"{parts}  |  Total: {total:.1f}ms")
         self.reset()
 
     def reset(self):
@@ -703,22 +806,56 @@ def _speak_hazard_warnings(
                 if track_id not in _warned_track_ids:
                     speak_text(f"{label} {dist_m:.1f} meters")
                     _warned_track_ids.add(track_id)
-                    print(f"Hazard: {label} [ID {track_id}] at {dist_m:.1f} m")
+                    if DEBUG:
+                        print(f"Hazard: {label} [ID {track_id}] at {dist_m:.1f} m")
             else:
                 speak_text(f"{label} {dist_m:.1f} meters")
-                print(f"Hazard: {label} at {dist_m:.1f} m")
+                if DEBUG:
+                    print(f"Hazard: {label} at {dist_m:.1f} m")
             break
 
 
-def _draw_debug_overlay(rgb_frame: np.ndarray, red_rois: list, tracks: list, detections: list) -> bool:
+def _draw_debug_overlay(
+    rgb_frame: np.ndarray,
+    red_rois: list,
+    yellow_rois: list,
+    floor_rois: list,
+    tracks: list,
+    detections: list,
+) -> bool:
     """
-    Draw bounding boxes on rgb_frame for SHOW_WINDOWS. Returns True if user pressed 'q'.
+    Draw ROI regions (red/yellow/blue) with distances and detection boxes.
+    Pushes frame to MJPEG stream. Returns False always.
     """
     if not SHOW_WINDOWS or rgb_frame is None:
         return False
+
+    # Semi-transparent filled ROI regions
+    overlay = rgb_frame.copy()
+    for roi_info, color in (
+        [(r, (0, 0, 180)) for r in red_rois]
+        + [(r, (0, 180, 180)) for r in yellow_rois]
+    ):
+        x1, y1, x2, y2 = roi_info["roi_rect"]
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), color, -1)
+    cv2.addWeighted(overlay, 0.3, rgb_frame, 0.7, 0, rgb_frame)
+
+    # ROI borders + distance labels
+    for roi_info, color in (
+        [(r, (0, 0, 255)) for r in red_rois]
+        + [(r, (0, 255, 255)) for r in yellow_rois]
+    ):
+        x1, y1, x2, y2 = roi_info["roi_rect"]
+        cv2.rectangle(rgb_frame, (x1, y1), (x2, y2), color, 1)
+        d = roi_info["distance"]
+        if d > 0:
+            cv2.putText(
+                rgb_frame, f"d:{d/1000:.1f}m", (x1 + 2, y2 - 2),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.28, color, 1,
+            )
+
+    # Object detection / tracking boxes
     items = tracks if (ENABLE_TRACKING and tracks) else detections
-    if not red_rois:
-        items = []
     for item in items:
         if "track_id" in item:
             x1, y1, x2, y2 = item["bbox"]
@@ -727,13 +864,16 @@ def _draw_debug_overlay(rgb_frame: np.ndarray, red_rois: list, tracks: list, det
             bx, by, bw, bh = item["bbox"]
             x1, y1, x2, y2 = bx, by, bx + bw, by + bh
             lbl = item["class"]
-        cv2.rectangle(rgb_frame, (x1, y1), (x2, y2), (128, 0, 128), 2)
+        cv2.rectangle(rgb_frame, (x1, y1), (x2, y2), (255, 0, 255), 2)
         cv2.putText(
-            rgb_frame, lbl, (x1, y1 - 8),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (128, 0, 128), 2,
+            rgb_frame, lbl, (x1, max(y1 - 6, 10)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 2,
         )
-    cv2.imshow("rgb", rgb_frame)
-    return cv2.waitKey(1) == ord("q")
+
+    ok, buf = cv2.imencode(".jpg", rgb_frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+    if ok:
+        _push_stream_frame(buf.tobytes())
+    return False
 
 
 def run_main_loop(pipeline, depth_queue, spatial_queue, rgb_queue):
@@ -763,6 +903,12 @@ def run_main_loop(pipeline, depth_queue, spatial_queue, rgb_queue):
 
             timer.log("capture")
 
+            if not _system_active.is_set():
+                vibrate_motors([(0, 0), (0, 0), (0, 0)])
+                frame_count += 1
+                timer.print_and_reset()
+                continue
+
             if frame_count % DETECT_EVERY_N == 0 and jpeg_bytes and _looks_like_jpeg(jpeg_bytes):
                 _enqueue_jpeg(jpeg_bytes)
 
@@ -789,7 +935,7 @@ def run_main_loop(pipeline, depth_queue, spatial_queue, rgb_queue):
             _speak_hazard_warnings(red_rois, tracks, detections, depth_frame)
             timer.log("warn")
 
-            if _draw_debug_overlay(rgb_frame, red_rois, tracks, detections):
+            if _draw_debug_overlay(rgb_frame, red_rois, yellow_rois, floor_rois, tracks, detections):
                 break
 
             vibrate_motors(region_config)
@@ -817,6 +963,8 @@ def main():
 
     init_speech_to_text(variant="base")
 
+    _start_stream_server()
+
     detect_thread = threading.Thread(
         target=_detection_worker,
         daemon=True,
@@ -825,7 +973,8 @@ def main():
     detect_thread.start()
 
     vibrate_motors([(1, 2000), (1, 2000), (1, 2000)])
-    print("PROGRAM STARTED")
+    if DEBUG:
+        print("PROGRAM STARTED")
 
     pipeline, depth_queue, spatial_queue, rgb_queue = build_pipeline()
     run_main_loop(pipeline, depth_queue, spatial_queue, rgb_queue)
